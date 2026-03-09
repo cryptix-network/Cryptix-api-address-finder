@@ -1,0 +1,10 @@
+base_url = "http://rest.seed1.cryptix-network.org"
+limit = 200
+page_delay_seconds = 5
+request_timeout_seconds = 30
+allow_invalid_certs = true
+
+[retry]
+enabled = true
+retry_delay_seconds = 5
+max_attempts = 5
