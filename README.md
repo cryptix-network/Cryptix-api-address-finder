@@ -41,4 +41,3 @@ Next, enter the letters of the wallet that you already know, for example “vpnz
 
 Source code for Linux, or you can compile it yourself, is also available. It's a simple little Rust script.
 
-https://github.com/cryptix-network/Cryptix-api-address-finder
