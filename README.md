@@ -41,3 +41,8 @@ Next, enter the letters of the wallet that you already know, for example “vpnz
 
 Source code for Linux, or you can compile it yourself, is also available. It's a simple little Rust script.
 
+
+----
+
+It also works with other coins/blockchains if they use the same REST API. The URL can be changed in the configuration. Licensed under MIT - do what you want with it.
+
