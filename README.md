@@ -12,8 +12,17 @@ cargo run --release
 
 The app asks for:
 1. Source wallet address
-2. Search term (full address or partial text)
-3. Scan mode
+2. Scan mode
+3. Search term (only for modes 1-4)
+
+Available scan modes:
+1. Scan for full address (until first hit)
+2. Scan for full address (fixed depth)
+3. Scan for transactions (until first hit)
+4. Scan for transactions (fixed depth)
+5. Scan outgoing destination addresses (fixed depth)
+
+For fixed-depth modes, each depth step scans one full page (`limit` entries) and advances the API `offset` by `limit`.
 
 ## Config
 

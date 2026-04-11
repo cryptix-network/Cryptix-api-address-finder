@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::{redirect::Policy, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fs;
 use std::io::{self, Write};
@@ -53,6 +53,7 @@ enum Mode {
     FullAddressDepth(u64),
     TransactionsUntilFirstHit,
     TransactionsDepth(u64),
+    OutgoingAddressesDepth(u64),
 }
 
 #[tokio::main]
@@ -67,24 +68,20 @@ async fn main() -> Result<()> {
         return Err(anyhow!("Source wallet address must not be empty."));
     }
 
-    let needle = prompt("2) Search term (wallet address or partial text, e.g. z7lo9): ")?;
-    if needle.trim().is_empty() {
-        return Err(anyhow!("Search term must not be empty."));
-    }
-
     println!();
-    println!("3) Select mode:");
+    println!("2) Select mode:");
     println!("1. Scan for full address (until first hit)");
     println!("2. Scan for full address (fixed depth)");
     println!("3. Scan for transactions (until first hit)");
     println!("4. Scan for transactions (fixed depth)");
+    println!("5. Scan outgoing destination addresses (fixed depth)");
 
     let mode = loop {
-        let choice = prompt("Choice (1-4): ")?;
+        let choice = prompt("Choice (1-5): ")?;
         match choice.trim() {
             "1" => break Mode::FullAddressUntilFirstHit,
             "2" => {
-                let depth = prompt_u64("Depth in pages (offset starts at 0): ")?;
+                let depth = prompt_u64("Depth in pages (page 1 starts at offset 0): ")?;
                 if depth == 0 {
                     println!("Depth must be > 0.");
                     continue;
@@ -93,25 +90,50 @@ async fn main() -> Result<()> {
             }
             "3" => break Mode::TransactionsUntilFirstHit,
             "4" => {
-                let depth = prompt_u64("Depth in pages (offset starts at 0): ")?;
+                let depth = prompt_u64("Depth in pages (page 1 starts at offset 0): ")?;
                 if depth == 0 {
                     println!("Depth must be > 0.");
                     continue;
                 }
                 break Mode::TransactionsDepth(depth);
             }
-            _ => println!("Invalid choice. Please enter 1, 2, 3, or 4."),
+            "5" => {
+                let depth = prompt_u64("Depth in pages (page 1 starts at offset 0): ")?;
+                if depth == 0 {
+                    println!("Depth must be > 0.");
+                    continue;
+                }
+                break Mode::OutgoingAddressesDepth(depth);
+            }
+            _ => println!("Invalid choice. Please enter 1, 2, 3, 4, or 5."),
         }
     };
 
+    let needle = if uses_search_needle(mode) {
+        let value = prompt("3) Search term (wallet address or partial text, e.g. z7lo9): ")?;
+        if value.trim().is_empty() {
+            return Err(anyhow!("Search term must not be empty for this mode."));
+        }
+        Some(value)
+    } else {
+        None
+    };
+
     println!();
-    println!(
-        "Start: source={}, needle={}, base_url={}, limit={}, delay={}s",
-        source_wallet, needle, config.base_url, config.limit, config.page_delay_seconds
-    );
+    if let Some(search) = &needle {
+        println!(
+            "Start: source={}, needle={}, base_url={}, limit={}, delay={}s",
+            source_wallet, search, config.base_url, config.limit, config.page_delay_seconds
+        );
+    } else {
+        println!(
+            "Start: source={}, mode=outgoing destination addresses, base_url={}, limit={}, delay={}s",
+            source_wallet, config.base_url, config.limit, config.page_delay_seconds
+        );
+    }
     println!();
 
-    run_scan(&config, &source_wallet, &needle, mode).await
+    run_scan(&config, &source_wallet, needle.as_deref(), mode).await
 }
 
 fn load_or_create_config(path: &str) -> Result<Config> {
@@ -124,14 +146,29 @@ fn load_or_create_config(path: &str) -> Result<Config> {
         println!("Config {} was created. Using default values.", path);
     }
 
-    let raw = fs::read_to_string(config_path)
-        .with_context(|| format!("Failed to read {}.", path))?;
+    let raw =
+        fs::read_to_string(config_path).with_context(|| format!("Failed to read {}.", path))?;
     let config: Config =
         toml::from_str(&raw).with_context(|| format!("Invalid TOML in {}.", path))?;
     Ok(config)
 }
 
-async fn run_scan(config: &Config, source_wallet: &str, needle: &str, mode: Mode) -> Result<()> {
+fn uses_search_needle(mode: Mode) -> bool {
+    matches!(
+        mode,
+        Mode::FullAddressUntilFirstHit
+            | Mode::FullAddressDepth(_)
+            | Mode::TransactionsUntilFirstHit
+            | Mode::TransactionsDepth(_)
+    )
+}
+
+async fn run_scan(
+    config: &Config,
+    source_wallet: &str,
+    needle: Option<&str>,
+    mode: Mode,
+) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(config.request_timeout_seconds))
         .connect_timeout(Duration::from_secs(config.request_timeout_seconds))
@@ -145,25 +182,35 @@ async fn run_scan(config: &Config, source_wallet: &str, needle: &str, mode: Mode
         println!("WARNING: TLS certificate verification is disabled (allow_invalid_certs=true).");
     }
 
-    let needle_lc = needle.to_lowercase();
-    let mut offset: u64 = 0;
+    let needle_lc = needle.map(|value| value.to_lowercase());
+    let mut page_index: u64 = 0;
     let max_pages = match mode {
-        Mode::FullAddressDepth(depth) | Mode::TransactionsDepth(depth) => Some(depth),
+        Mode::FullAddressDepth(depth)
+        | Mode::TransactionsDepth(depth)
+        | Mode::OutgoingAddressesDepth(depth) => Some(depth),
         Mode::FullAddressUntilFirstHit | Mode::TransactionsUntilFirstHit => None,
     };
 
     let mut collected_addresses: HashSet<String> = HashSet::new();
     let mut collected_transactions: Vec<Value> = Vec::new();
+    let mut collected_outgoing_addresses: HashSet<String> = HashSet::new();
+    let mut prevout_address_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut tx_cache: HashMap<String, Value> = HashMap::new();
 
     loop {
         if let Some(max) = max_pages {
-            if offset >= max {
+            if page_index >= max {
                 break;
             }
         }
 
-        println!("Scanning offset={} ...", offset);
-        let page = fetch_page(config, &client, source_wallet, offset).await?;
+        let request_offset = page_index.saturating_mul(config.limit as u64);
+        println!(
+            "Scanning page={} (offset={}) ...",
+            page_index + 1,
+            request_offset
+        );
+        let page = fetch_page(config, &client, source_wallet, request_offset).await?;
 
         if page.is_empty() {
             println!("No more transactions on this page. Scan finished.");
@@ -172,20 +219,57 @@ async fn run_scan(config: &Config, source_wallet: &str, needle: &str, mode: Mode
 
         let mut page_hits = 0usize;
         for tx in page {
-            let matches = matching_addresses(&tx, &needle_lc);
-            if matches.is_empty() {
-                continue;
+            if let Some(tx_id) = tx
+                .get("transaction_id")
+                .and_then(Value::as_str)
+                .or_else(|| tx.get("hash").and_then(Value::as_str))
+            {
+                tx_cache
+                    .entry(tx_id.to_string())
+                    .or_insert_with(|| tx.clone());
             }
 
-            page_hits += 1;
             match mode {
                 Mode::FullAddressUntilFirstHit | Mode::FullAddressDepth(_) => {
+                    let search = needle_lc.as_deref().unwrap_or_default();
+                    let matches = matching_addresses(&tx, search);
+                    if matches.is_empty() {
+                        continue;
+                    }
+
+                    page_hits += 1;
                     for addr in matches {
                         collected_addresses.insert(addr);
                     }
                 }
                 Mode::TransactionsUntilFirstHit | Mode::TransactionsDepth(_) => {
+                    let search = needle_lc.as_deref().unwrap_or_default();
+                    let matches = matching_addresses(&tx, search);
+                    if matches.is_empty() {
+                        continue;
+                    }
+
+                    page_hits += 1;
                     collected_transactions.push(tx);
+                }
+                Mode::OutgoingAddressesDepth(_) => {
+                    let destinations = outgoing_destination_addresses(
+                        config,
+                        &client,
+                        &tx,
+                        source_wallet,
+                        &mut prevout_address_cache,
+                        &mut tx_cache,
+                    )
+                    .await?;
+                    if destinations.is_empty() {
+                        continue;
+                    }
+
+                    page_hits += 1;
+                    for addr in destinations {
+                        collected_outgoing_addresses.insert(addr);
+                    }
                 }
             }
         }
@@ -195,7 +279,7 @@ async fn run_scan(config: &Config, source_wallet: &str, needle: &str, mode: Mode
                 if page_hits > 0 {
                     println!(
                         "Hit on offset={}: {} transaction(s), {} unique address(es) collected.",
-                        offset,
+                        request_offset,
                         page_hits,
                         collected_addresses.len()
                     );
@@ -205,16 +289,28 @@ async fn run_scan(config: &Config, source_wallet: &str, needle: &str, mode: Mode
                 if page_hits > 0 {
                     println!(
                         "Hit on offset={}: {} transaction(s), {} collected.",
-                        offset,
+                        request_offset,
                         page_hits,
                         collected_transactions.len()
                     );
                 }
             }
+            Mode::OutgoingAddressesDepth(_) => {
+                if page_hits > 0 {
+                    println!(
+                        "Outgoing hit on offset={}: {} transaction(s), {} unique destination address(es) collected.",
+                        request_offset,
+                        page_hits,
+                        collected_outgoing_addresses.len()
+                    );
+                }
+            }
         }
 
-        let stop_on_first_hit =
-            matches!(mode, Mode::FullAddressUntilFirstHit | Mode::TransactionsUntilFirstHit);
+        let stop_on_first_hit = matches!(
+            mode,
+            Mode::FullAddressUntilFirstHit | Mode::TransactionsUntilFirstHit
+        );
 
         if stop_on_first_hit {
             let hit_found = match mode {
@@ -229,14 +325,17 @@ async fn run_scan(config: &Config, source_wallet: &str, needle: &str, mode: Mode
             }
         }
 
-        offset += 1;
+        page_index += 1;
         if let Some(max) = max_pages {
-            if offset >= max {
+            if page_index >= max {
                 break;
             }
         }
 
-        println!("Waiting {}s before next page ...", config.page_delay_seconds);
+        println!(
+            "Waiting {}s before next page ...",
+            config.page_delay_seconds
+        );
         sleep(Duration::from_secs(config.page_delay_seconds)).await;
     }
 
@@ -267,6 +366,18 @@ async fn run_scan(config: &Config, source_wallet: &str, needle: &str, mode: Mode
                 }
             }
         }
+        Mode::OutgoingAddressesDepth(_) => {
+            if collected_outgoing_addresses.is_empty() {
+                println!("No outgoing destination addresses found.");
+            } else {
+                let mut list: Vec<String> = collected_outgoing_addresses.into_iter().collect();
+                list.sort_unstable();
+                println!("Outgoing destination addresses ({}):", list.len());
+                for addr in list {
+                    println!("- {}", addr);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -281,7 +392,10 @@ async fn fetch_page(
     let encoded_wallet = urlencoding::encode(source_wallet);
     let urls = request_urls(config, &encoded_wallet, offset);
     if urls.is_empty() {
-        return Err(anyhow!("Invalid base_url in config.toml: '{}'", config.base_url));
+        return Err(anyhow!(
+            "Invalid base_url in config.toml: '{}'",
+            config.base_url
+        ));
     }
 
     let mut attempts = 0u32;
@@ -327,11 +441,7 @@ async fn fetch_page(
                     return Err(err);
                 }
                 Err(err) => {
-                    network_errors.push(format!(
-                        "{} -> {}",
-                        url,
-                        format_reqwest_error(&err)
-                    ));
+                    network_errors.push(format!("{} -> {}", url, format_reqwest_error(&err)));
                 }
             }
         }
@@ -384,6 +494,30 @@ fn request_urls(config: &Config, encoded_wallet: &str, offset: u64) -> Vec<Strin
     }
 }
 
+fn request_transaction_urls(config: &Config, transaction_id: &str) -> Vec<String> {
+    let base = config.base_url.trim().trim_end_matches('/').to_string();
+    if base.is_empty() {
+        return Vec::new();
+    }
+
+    let encoded_txid = urlencoding::encode(transaction_id);
+    let suffix = format!("/transactions/{}", encoded_txid);
+
+    if let Some(rest) = base.strip_prefix("https://") {
+        let https = format!("https://{}{}", rest, suffix);
+        let http = format!("http://{}{}", rest, suffix);
+        vec![https, http]
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        let https = format!("https://{}{}", rest, suffix);
+        let http = format!("http://{}{}", rest, suffix);
+        vec![https, http]
+    } else {
+        let https = format!("https://{}{}", base, suffix);
+        let http = format!("http://{}{}", base, suffix);
+        vec![https, http]
+    }
+}
+
 fn format_reqwest_error(err: &reqwest::Error) -> String {
     let mut parts = vec![err.to_string()];
     let mut source = err.source();
@@ -416,6 +550,196 @@ fn matching_addresses(tx: &Value, needle_lc: &str) -> Vec<String> {
         .filter(|addr| addr.to_lowercase().contains(needle_lc))
         .filter(|addr| seen.insert(addr.clone()))
         .collect()
+}
+
+async fn outgoing_destination_addresses(
+    config: &Config,
+    client: &Client,
+    tx: &Value,
+    source_wallet: &str,
+    prevout_address_cache: &mut HashMap<String, Option<String>>,
+    tx_cache: &mut HashMap<String, Value>,
+) -> Result<Vec<String>> {
+    let inputs = match tx.get("inputs").and_then(Value::as_array) {
+        Some(value) => value,
+        None => return Ok(Vec::new()),
+    };
+    let outputs = match tx.get("outputs").and_then(Value::as_array) {
+        Some(value) => value,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut has_source_in_inputs = false;
+    for input in inputs {
+        if let Some(addr) = input
+            .get("previous_outpoint_address")
+            .and_then(Value::as_str)
+        {
+            if addr.eq_ignore_ascii_case(source_wallet) {
+                has_source_in_inputs = true;
+                break;
+            }
+        }
+
+        let prev_hash = input.get("previous_outpoint_hash").and_then(Value::as_str);
+        let prev_index = input.get("previous_outpoint_index").and_then(Value::as_u64);
+        let (Some(prev_hash), Some(prev_index)) = (prev_hash, prev_index) else {
+            continue;
+        };
+
+        let prev_address = resolve_previous_outpoint_address(
+            config,
+            client,
+            prev_hash,
+            prev_index,
+            prevout_address_cache,
+            tx_cache,
+        )
+        .await?;
+
+        if let Some(addr) = prev_address {
+            if addr.eq_ignore_ascii_case(source_wallet) {
+                has_source_in_inputs = true;
+                break;
+            }
+        }
+    }
+
+    if !has_source_in_inputs {
+        return Ok(Vec::new());
+    }
+
+    let mut output_addresses = Vec::new();
+    for output in outputs {
+        collect_addresses(output, &mut output_addresses);
+    }
+
+    let mut seen = HashSet::new();
+    let destinations: Vec<String> = output_addresses
+        .into_iter()
+        .filter(|addr| !addr.eq_ignore_ascii_case(source_wallet))
+        .filter(|addr| seen.insert(addr.to_lowercase()))
+        .collect();
+
+    Ok(destinations)
+}
+
+async fn resolve_previous_outpoint_address(
+    config: &Config,
+    client: &Client,
+    prev_hash: &str,
+    prev_index: u64,
+    prevout_address_cache: &mut HashMap<String, Option<String>>,
+    tx_cache: &mut HashMap<String, Value>,
+) -> Result<Option<String>> {
+    let cache_key = format!("{}:{}", prev_hash, prev_index);
+    if let Some(cached) = prevout_address_cache.get(&cache_key) {
+        return Ok(cached.clone());
+    }
+
+    let previous_tx = fetch_transaction(config, client, prev_hash, tx_cache).await?;
+    let address = previous_tx
+        .get("outputs")
+        .and_then(Value::as_array)
+        .and_then(|outputs| {
+            outputs
+                .iter()
+                .find(|out| out.get("index").and_then(Value::as_u64) == Some(prev_index))
+        })
+        .and_then(|out| out.get("script_public_key_address").and_then(Value::as_str))
+        .map(|value| value.to_string());
+
+    prevout_address_cache.insert(cache_key, address.clone());
+    Ok(address)
+}
+
+async fn fetch_transaction(
+    config: &Config,
+    client: &Client,
+    transaction_id: &str,
+    tx_cache: &mut HashMap<String, Value>,
+) -> Result<Value> {
+    if let Some(cached) = tx_cache.get(transaction_id) {
+        return Ok(cached.clone());
+    }
+
+    let urls = request_transaction_urls(config, transaction_id);
+    if urls.is_empty() {
+        return Err(anyhow!(
+            "Invalid base_url in config.toml: '{}'",
+            config.base_url
+        ));
+    }
+
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let mut network_errors: Vec<String> = Vec::new();
+
+        for url in &urls {
+            let response = client.get(url).send().await;
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    let data = resp.json::<Value>().await.with_context(|| {
+                        format!(
+                            "Invalid transaction JSON response for transaction_id={}",
+                            transaction_id
+                        )
+                    })?;
+                    tx_cache.insert(transaction_id.to_string(), data.clone());
+                    return Ok(data);
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "<no response details>".to_string());
+
+                    let err = anyhow!(
+                        "HTTP error for transaction_id={}: status={}, body={}",
+                        transaction_id,
+                        status,
+                        body
+                    );
+
+                    if should_retry(config, attempts) {
+                        println!(
+                            "Error: {:#}. Retrying in {}s (attempt {}).",
+                            err, config.retry.retry_delay_seconds, attempts
+                        );
+                        sleep(Duration::from_secs(config.retry.retry_delay_seconds)).await;
+                        break;
+                    }
+
+                    return Err(err);
+                }
+                Err(err) => {
+                    network_errors.push(format!("{} -> {}", url, format_reqwest_error(&err)));
+                }
+            }
+        }
+
+        if !network_errors.is_empty() {
+            if should_retry(config, attempts) {
+                println!(
+                    "Network error for transaction_id={}. Retrying in {}s (attempt {}).",
+                    transaction_id, config.retry.retry_delay_seconds, attempts
+                );
+                for detail in &network_errors {
+                    println!("  {}", detail);
+                }
+                sleep(Duration::from_secs(config.retry.retry_delay_seconds)).await;
+                continue;
+            }
+
+            return Err(anyhow!(
+                "Network error for transaction_id={}. Tried:\n{}",
+                transaction_id,
+                network_errors.join("\n")
+            ));
+        }
+    }
 }
 
 fn collect_addresses(value: &Value, out: &mut Vec<String>) {
@@ -452,7 +776,9 @@ fn prompt(label: &str) -> Result<String> {
     print!("{label}");
     io::stdout().flush().context("stdout flush failed")?;
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf).context("stdin read failed")?;
+    io::stdin()
+        .read_line(&mut buf)
+        .context("stdin read failed")?;
     Ok(buf.trim().to_string())
 }
 
